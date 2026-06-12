@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Generated AI Intel Bot outputs
+latest_input_compact.json
+latest_report.json
+latest_report_raw.txt
+latest_report.txt
+claude_error_output.txt
+
+# Logs
+*.log
+logs/
+
+# OS / editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Data / cache
+.cache/
+output/
+daily_reports/
