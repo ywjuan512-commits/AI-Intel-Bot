@@ -18,6 +18,7 @@ latest_input_compact.json
 latest_report.json
 latest_report_raw.txt
 latest_report.txt
+latest_prompt.txt
 claude_error_output.txt
 
 # Logs
