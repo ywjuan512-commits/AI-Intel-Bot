@@ -1,6 +1,10 @@
+import argparse
+import logging
 import os
 import re
 import json
+import sys
+import time
 import requests
 import feedparser
 from datetime import datetime
@@ -32,6 +36,23 @@ LINE_USER_ID = os.getenv("LINE_USER_ID")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+logger = logging.getLogger("ai_intel_report")
+
+
+def setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    log_path = os.path.join("logs", f"ai_intel_bot_{datetime.now().strftime('%Y-%m-%d')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_path, encoding="utf-8"),
+        ],
+    )
+    logger.info("Logging initialized: %s", log_path)
+
+
 
 # =====================
 # Basic helpers
@@ -61,7 +82,13 @@ def safe_get(data, path, default=None):
 # =====================
 
 def fetch_rss_items(feed_url, limit=3):
-    feed = feedparser.parse(feed_url)
+    headers = {"User-Agent": "personal-ai-intel-bot/1.0"}
+    response = requests.get(feed_url, headers=headers, timeout=15)
+    response.raise_for_status()
+    feed = feedparser.parse(response.content)
+    if getattr(feed, "bozo", False):
+        logger.warning("RSS parse warning for %s: %s", feed_url, getattr(feed, "bozo_exception", "unknown"))
+
     items = []
 
     for entry in feed.entries[:limit]:
@@ -76,24 +103,39 @@ def fetch_rss_items(feed_url, limit=3):
 
 def fetch_all_rss():
     results = {}
+    source_status = {}
     per_feed = DISCOVERY_LIMITS.get("rss_per_feed", 3)
 
     for category, urls in RSS_FEEDS.items():
         category_items = []
+        feed_statuses = []
 
         for url in urls:
             try:
-                category_items.extend(fetch_rss_items(url, limit=per_feed))
+                items = fetch_rss_items(url, limit=per_feed)
+                category_items.extend(items)
+                feed_statuses.append({
+                    "url": url,
+                    "status": "OK",
+                    "items": len(items),
+                })
             except Exception as e:
+                logger.warning("RSS讀取失敗：%s (%s)", url, e)
                 category_items.append({
                     "title": f"RSS讀取失敗：{url}",
                     "link": "",
                     "summary": str(e),
                 })
+                feed_statuses.append({
+                    "url": url,
+                    "status": "ERROR",
+                    "error": str(e),
+                })
 
         results[category] = category_items[:7]
+        source_status[category] = feed_statuses
 
-    return results
+    return {"status": source_status, "items": results}
 
 
 def fetch_yahoo_stock_news(symbol):
@@ -119,7 +161,8 @@ def fetch_stock_news():
 def fetch_global_discovery_candidates(rss_data):
     candidates = []
 
-    for category, items in rss_data.items():
+    rss_items = rss_data.get("items", rss_data)
+    for category, items in rss_items.items():
         for item in items:
             text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
 
@@ -323,6 +366,36 @@ def fetch_market_radar_safe():
         }
 
 
+def build_source_status(market_radar, rss, stock_news, reddit, twse_hot):
+    def has_error_items(items):
+        return any(
+            isinstance(item, dict)
+            and (
+                item.get("error")
+                or "讀取失敗" in str(item.get("title", ""))
+                or item.get("status") == "ERROR"
+            )
+            for item in items
+        )
+
+    stock_errors = {
+        symbol: "ERROR" if has_error_items(items) else "OK"
+        for symbol, items in stock_news.items()
+    }
+    reddit_errors = {
+        subreddit: "ERROR" if has_error_items(posts) else "OK"
+        for subreddit, posts in reddit.items()
+    }
+
+    return {
+        "market_radar": "ERROR" if market_radar.get("error") else "OK",
+        "rss": rss.get("status", {}),
+        "stock_news": stock_errors,
+        "reddit": reddit_errors,
+        "twse": "ERROR" if has_error_items(twse_hot) else "OK",
+    }
+
+
 # =====================
 # Prompt compaction
 # =====================
@@ -335,7 +408,9 @@ def compact_data_for_prompt(data):
     max_dynamic = PROMPT_LIMITS.get("max_dynamic_items", 10)
 
     rss_flat = []
-    for category, items in data.get("rss", {}).items():
+    rss_data = data.get("rss", {})
+    rss_items = rss_data.get("items", rss_data)
+    for category, items in rss_items.items():
         for item in items:
             rss_flat.append({
                 "category": category,
@@ -368,14 +443,25 @@ def compact_data_for_prompt(data):
 
 
 def build_input_data():
-    market_radar = fetch_market_radar_safe()
-    rss = fetch_all_rss()
-    stock_news = fetch_stock_news()
-    reddit = fetch_reddit_discussions()
-    twse_hot = fetch_twse_hot_stocks()
+    source_metrics = {}
+
+    def timed(name, func):
+        started = time.perf_counter()
+        value = func()
+        source_metrics[f"{name}_seconds"] = round(time.perf_counter() - started, 2)
+        logger.info("%s completed in %.2fs", name, source_metrics[f"{name}_seconds"])
+        return value
+
+    market_radar = timed("market_radar", fetch_market_radar_safe)
+    rss = timed("rss", fetch_all_rss)
+    stock_news = timed("stock_news", fetch_stock_news)
+    reddit = timed("reddit", fetch_reddit_discussions)
+    twse_hot = timed("twse", fetch_twse_hot_stocks)
 
     data = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_metrics": source_metrics,
+        "source_status": build_source_status(market_radar, rss, stock_news, reddit, twse_hot),
         "market_radar": market_radar,
         "ai_supply_chain_reference": AI_SUPPLY_CHAIN,
         "taiwan_themes_reference": TAIWAN_THEMES,
@@ -511,7 +597,83 @@ JSON 格式必須如下：
 
 原始資料：
 {json.dumps(data, ensure_ascii=False, indent=2)}
-"""
+    """
+
+
+def ensure_list(value):
+    if isinstance(value, list):
+        return value
+    if value in (None, ""):
+        return []
+    return [value]
+
+
+def ensure_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def coerce_score(value, default=50):
+    try:
+        score = int(float(value))
+    except Exception:
+        score = default
+    return max(0, min(100, score))
+
+
+def validate_intel_payload(intel):
+    if not isinstance(intel, dict):
+        raise ValueError("Claude JSON root must be an object")
+
+    market = ensure_dict(intel.get("market_view"))
+    market["status"] = market.get("status") or "Neutral"
+    market["score"] = coerce_score(market.get("score"), 50)
+    market["one_liner"] = market.get("one_liner") or "資料不足，維持觀察。"
+    market["us_bias"] = market.get("us_bias") or "觀望"
+    market["tw_bias"] = market.get("tw_bias") or "觀望"
+    market["key_drivers"] = ensure_list(market.get("key_drivers"))
+    market["key_risks"] = ensure_list(market.get("key_risks"))
+    intel["market_view"] = market
+
+    cycle = ensure_dict(intel.get("ai_cycle_radar"))
+    cycle["cycle_status"] = cycle.get("cycle_status") or "觀察中"
+    cycle["one_liner"] = cycle.get("one_liner") or "資料不足，觀察中。"
+    cycle["main_theme"] = cycle.get("main_theme") or "觀察中"
+    cycle["cycle_risk"] = cycle.get("cycle_risk") or "資料不足"
+    memory = ensure_dict(cycle.get("memory_cycle"))
+    memory["status"] = memory.get("status") or "資料不足"
+    memory["summary"] = memory.get("summary") or "資料不足"
+    memory["confidence"] = coerce_score(memory.get("confidence"), 0)
+    cycle["memory_cycle"] = memory
+    cycle["theme_heat"] = [
+        {
+            "theme": ensure_dict(item).get("theme", "觀察中"),
+            "score": coerce_score(ensure_dict(item).get("score"), 0),
+            "reason": ensure_dict(item).get("reason", "資料不足"),
+        }
+        for item in ensure_list(cycle.get("theme_heat"))
+        if isinstance(item, dict)
+    ]
+    intel["ai_cycle_radar"] = cycle
+
+    flow = ensure_dict(intel.get("capital_flow"))
+    flow["one_liner"] = flow.get("one_liner") or "資料不足，觀察中。"
+    flow["us_leaders"] = [ensure_dict(item) for item in ensure_list(flow.get("us_leaders")) if isinstance(item, dict)]
+    flow["tw_leaders"] = [ensure_dict(item) for item in ensure_list(flow.get("tw_leaders")) if isinstance(item, dict)]
+    flow["weak_or_watchout"] = ensure_list(flow.get("weak_or_watchout"))
+    intel["capital_flow"] = flow
+
+    intel["supply_chain"] = [ensure_dict(item) for item in ensure_list(intel.get("supply_chain")) if isinstance(item, dict)]
+
+    discovery = ensure_dict(intel.get("discovery_watchlist"))
+    discovery["new_stocks"] = [ensure_dict(item) for item in ensure_list(discovery.get("new_stocks")) if isinstance(item, dict)]
+    discovery["new_themes"] = [ensure_dict(item) for item in ensure_list(discovery.get("new_themes")) if isinstance(item, dict)]
+    discovery["event_watch"] = ensure_list(discovery.get("event_watch"))
+    discovery["watch_next"] = ensure_list(discovery.get("watch_next"))
+    discovery["noise_or_signal"] = discovery.get("noise_or_signal") or "資料不足，觀察中。"
+    intel["discovery_watchlist"] = discovery
+    intel["final_view"] = intel.get("final_view") or "資料不足，維持觀察。"
+
+    return intel
 
 
 def ask_claude_json(prompt):
@@ -524,12 +686,53 @@ def ask_claude_json(prompt):
     text = message.content[0].text.strip()
 
     try:
-        return json.loads(text), text
+        return validate_intel_payload(json.loads(text)), text
     except Exception:
         match = re.search(r"\{.*\}", text, re.S)
         if match:
-            return json.loads(match.group()), text
+            return validate_intel_payload(json.loads(match.group())), text
         raise ValueError("Claude 回傳不是有效 JSON")
+
+
+def validate_line_message(message):
+    if not isinstance(message, dict):
+        raise ValueError("LINE message must be a dict")
+
+    msg_type = message.get("type")
+    if msg_type == "text":
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("LINE text message requires non-empty text")
+        if len(text) > 5000:
+            raise ValueError("LINE text message exceeds 5000 characters")
+        return message
+
+    if msg_type != "flex":
+        raise ValueError(f"Unsupported LINE message type: {msg_type}")
+
+    alt_text = message.get("altText")
+    if not isinstance(alt_text, str) or not alt_text.strip():
+        raise ValueError("LINE flex message requires non-empty altText")
+
+    contents = message.get("contents")
+    if not isinstance(contents, dict):
+        raise ValueError("LINE flex message requires contents object")
+
+    if contents.get("type") == "carousel":
+        bubbles = contents.get("contents")
+        if not isinstance(bubbles, list) or not bubbles:
+            raise ValueError("LINE carousel requires non-empty contents list")
+        if len(bubbles) > 12:
+            raise ValueError("LINE carousel supports at most 12 bubbles")
+        for bubble in bubbles:
+            if not isinstance(bubble, dict) or bubble.get("type") != "bubble":
+                raise ValueError("LINE carousel contents must be bubble objects")
+        return message
+
+    if contents.get("type") == "bubble":
+        return message
+
+    raise ValueError("LINE flex contents must be a bubble or carousel")
 
 
 # =====================
@@ -866,6 +1069,8 @@ def send_line_message(message):
         print("LINE 尚未設定，略過推播。")
         return None
 
+    validate_line_message(message)
+
     url = "https://api.line.me/v2/bot/message/push"
 
     headers = {
@@ -880,16 +1085,55 @@ def send_line_message(message):
 
     r = requests.post(url, headers=headers, json=payload, timeout=20)
     print("LINE status:", r.status_code, r.text)
+    logger.info("LINE status: %s %s", r.status_code, r.text)
     return r
 
 
-def main():
-    print("開始抓取資料...")
+def parse_args():
+    parser = argparse.ArgumentParser(description="AI Intel Bot V6 report runner")
+    parser.add_argument("--dry-run", action="store_true", help="只抓資料與產生 prompt，不呼叫 Claude，也不推播 LINE")
+    parser.add_argument("--no-line", action="store_true", help="呼叫 Claude 並產出報告，但不推播 LINE")
+    parser.add_argument("--collect-only", action="store_true", help="只抓資料並輸出 latest_input_compact.json，不產生 prompt / Claude / LINE")
+    parser.add_argument("--use-cache", help="使用既有 input JSON，略過即時資料抓取")
+    return parser.parse_args()
 
-    data = build_input_data()
+
+def main(args=None):
+    args = args or parse_args()
+    setup_logging()
+    logger.info(
+        "AI Intel Bot started dry_run=%s no_line=%s collect_only=%s use_cache=%s",
+        args.dry_run,
+        args.no_line,
+        args.collect_only,
+        args.use_cache,
+    )
+
+    if args.use_cache:
+        if not os.path.exists(args.use_cache):
+            raise FileNotFoundError(f"找不到快取資料檔案：{args.use_cache}")
+        print(f"使用快取資料：{args.use_cache}")
+        with open(args.use_cache, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        print("開始抓取資料...")
+        data = build_input_data()
 
     with open("latest_input_compact.json", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+    if args.collect_only:
+        logger.info("Collect-only completed: latest_input_compact.json written")
+        print("Collect-only 完成，已輸出 latest_input_compact.json，未產生 prompt / Claude / LINE。")
+        return
+
+    if args.dry_run:
+        prompt = build_prompt(data)
+        with open("latest_prompt.txt", "w", encoding="utf-8") as f:
+            f.write(prompt)
+        logger.info("Dry run completed: latest_input_compact.json and latest_prompt.txt written")
+        print("Dry run 完成，已輸出 latest_input_compact.json 與 latest_prompt.txt，未呼叫 Claude / LINE。")
+        return
 
     print("資料抓取完成，送 Claude 分析...")
 
@@ -904,8 +1148,17 @@ def main():
 
     print(json.dumps(intel, ensure_ascii=False, indent=2))
 
-    flex = build_flex_carousel(intel, input_data=data)
-    r = send_line_message(flex)
+    if args.no_line:
+        logger.info("No-line mode completed: report files written without LINE push")
+        print("No-line 模式：已產出報告，略過 LINE 推播。")
+        return
+
+    try:
+        flex = validate_line_message(build_flex_carousel(intel, input_data=data))
+        r = send_line_message(flex)
+    except Exception as e:
+        logger.exception("Flex payload validation/send failed: %s", e)
+        r = None
 
     if not r or r.status_code != 200:
         print("Flex 失敗，改傳純文字")
@@ -913,7 +1166,7 @@ def main():
             "type": "text",
             "text": build_plain_text(intel, input_data=data)[:4800],
         }
-        send_line_message(text_msg)
+        send_line_message(validate_line_message(text_msg))
 
 
 if __name__ == "__main__":

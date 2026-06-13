@@ -28,7 +28,8 @@ RSS_FEEDS = {
 
     "總體市場": [
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US",
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5ETwitter=US&lang=en-US",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=QQQ&region=US&lang=en-US",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SMH&region=US&lang=en-US",
     ],
 }
 

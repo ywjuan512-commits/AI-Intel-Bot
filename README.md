@@ -272,6 +272,44 @@ LINE Push Notification
 
 ⸻
 
+Release Readiness
+
+Before enabling the scheduled production run:
+
+1. Run automated checks
+
+```
+python -m unittest discover -s tests
+```
+
+2. Verify data collection only
+
+```
+python ai_intel_report.py --collect-only
+```
+
+3. Verify prompt generation without Claude / LINE
+
+```
+python ai_intel_report.py --dry-run
+```
+
+4. Verify Claude output without LINE push
+
+```
+python ai_intel_report.py --no-line
+```
+
+5. Re-run from cached input when debugging Claude / LINE output
+
+```
+python ai_intel_report.py --use-cache latest_input_compact.json --no-line
+```
+
+Only after these checks pass should the normal LINE push flow be enabled.
+
+⸻
+
 Long-Term Vision
 
 Market
